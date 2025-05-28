@@ -1,4 +1,6 @@
 streamlit
 python-docx
 pdfplumber
-PyPDF2
+pytesseract
+matplotlib
+PyMuPDF>=1.26.0
