@@ -10,6 +10,26 @@ from PIL import Image
 from docx import Document
 from docx.shared import Inches
 
+# Add this near the top of your app.py
+_invalid_xml_chars_re = re.compile(r'[\x00-\x08\x0B-\x0C\x0E-\x1F]')
+
+def cleanup_text(s: str) -> str:
+    """
+    Strip out control characters that Python-docx cannot serialize.
+    """
+    return _invalid_xml_chars_re.sub("", s)
+
+
+# In your create_word_document, update every run of add_run(part) to:
+for part in parts:
+    if part.startswith("$") and part.endswith("$"):
+        # … equation handling …
+    else:
+        clean = cleanup_text(part)
+        if clean:
+            qpara.add_run(clean)
+
+
 # Configure Streamlit page
 st.set_page_config(page_title="MCQ Processor", layout="wide")
 
@@ -126,7 +146,9 @@ def create_word_document(mcqs):
                 run = qpara.add_run()
                 run.add_picture(img_buf, width=Inches(2))
             else:
-                qpara.add_run(part)
+                clean = cleanup_text(part)
+                if clean:
+                    qpara.add_run(clean)
 
         # options
         for idx, opt in enumerate(mcq["options"]):
@@ -141,7 +163,9 @@ def create_word_document(mcqs):
                     run = para.add_run()
                     run.add_picture(buf, width=Inches(1.2))
                 else:
-                    para.add_run(part)
+                    clean = cleanup_text(part)
+                    if clean:
+                        qpara.add_run(clean)
 
         doc.add_paragraph()  # spacer
 
