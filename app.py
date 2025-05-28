@@ -1,198 +1,141 @@
 import streamlit as st
+import fitz  # PyMuPDF
+from docx import Document
+from docx.shared import Inches
+from PIL import Image
 import io
 import re
 
-import pymupdf as fitz
-import pdfplumber
-import pytesseract
-from PIL import Image
+st.title("MCQ PDF to Word Table Converter (with Images)")
 
-from docx import Document
-from docx.shared import Inches
-
-# Add this near the top of your app.py
-_invalid_xml_chars_re = re.compile(r'[\x00-\x08\x0B-\x0C\x0E-\x1F]')
-
-def cleanup_text(s: str) -> str:
+def extract_mcqs_and_images(pdf_file):
     """
-    Strip out control characters that Python-docx cannot serialize.
+    Extracts MCQs and images from the PDF.
+    Associates images to the closest preceding question.
+    Returns a list of dicts: {'question': ..., 'options': [...], 'image': ...}
     """
-    return _invalid_xml_chars_re.sub("", s)
-
-# Configure Streamlit page
-st.set_page_config(page_title="MCQ Processor", layout="wide")
-
-def clean_labels(text: str) -> str:
-    """
-    Remove question numbers (e.g. "1.") and option labels "(A)", "(B)", etc.
-    """
-    # strip leading question numbers
-    text = re.sub(r'^\s*\d+\.\s*', '', text, flags=re.MULTILINE)
-    # replace option labels with line breaks
-    text = re.sub(r'\s*\([A-D1-4]\)\s*', '\n', text)
-    return text.strip()
-
-def extract_text_advanced(uploaded_file) -> str:
-    """
-    Use PyMuPDF + OCR fallback + pdfplumber to get high-fidelity text.
-    """
-    pdf_bytes = uploaded_file.read()
-    text = ""
-    # 1. Use PyMuPDF for text
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    for page in doc:
-        block = page.get_text("text")
-        if block and len(block.strip()) > 20:
-            text += block + "\n"
-        else:
-            # OCR fallback
-            pix = page.get_pixmap(dpi=300)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            ocr = pytesseract.image_to_string(img, config="--psm 1")
-            text += ocr + "\n"
-    doc.close()
-    # 2. Supplement with pdfplumber (tables, columns)
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf2:
-            for p in pdf2.pages:
-                tbl_text = p.extract_text()
-                if tbl_text:
-                    text += tbl_text + "\n"
-    except Exception:
-        pass
-    return text
-
-def parse_mcq_text(raw: str):
-    """
-    Split raw text into MCQ blocks, clean labels, extract questions and options.
-    """
+    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
     mcqs = []
-    cleaned = clean_labels(raw)
-    # question blocks like "1. ..." -> after cleaning, look for splits by blank lines and numbering
-    blocks = re.split(r'\n(?=\d+\.)', raw)
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        # remove original numbering and option labels
-        block = clean_labels(block)
-        # split question vs options
-        parts = [p.strip() for p in block.split('\n') if p.strip()]
-        if len(parts) < 2:
-            continue
-        question_text = parts[0]
-        option_texts = parts[1:]
-        options = [{"text": o} for o in option_texts]
-        mcqs.append({"question": question_text, "options": options})
+    img_map = {}  # page_num -> list of (bbox, image_bytes, ext)
+    # Extract images per page
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        img_map[page_num] = []
+        for block in page.get_text("dict")["blocks"]:
+            if block["type"] == 1:  # image block
+                img_bytes = block["image"]
+                ext = block["ext"]
+                bbox = block["bbox"]
+                img_map[page_num].append((bbox, img_bytes, ext))
+    # Extract text and associate images
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        text_blocks = []
+        for block in page.get_text("dict")["blocks"]:
+            if block["type"] == 0:  # text block
+                text_blocks.append((block["bbox"], block["lines"]))
+        # Flatten text lines into paragraphs
+        paragraphs = []
+        for bbox, lines in text_blocks:
+            para = " ".join("".join(span["text"] for span in line["spans"]) for line in lines)
+            if para.strip():
+                paragraphs.append((bbox, para.strip()))
+        # Use regex to extract MCQs from paragraphs
+        for i, (bbox, para) in enumerate(paragraphs):
+            m = re.match(r'(\d+)\.\s*(.*)', para)
+            if not m:
+                continue
+            q_text = m.group(2)
+            # Find options
+            options = re.findall(r'\([A-D1-4]\)\s*([^\(]+)', q_text)
+            q_text_clean = re.split(r'\([A-D1-4]\)', q_text)[0].strip()
+            if options:
+                # Try to find the nearest image below this question
+                q_ymax = bbox[3]
+                img_bytes = None
+                img_ext = None
+                min_dist = float("inf")
+                for img_bbox, ib, iext in img_map[page_num]:
+                    img_ymin = img_bbox[1]
+                    dist = img_ymin - q_ymax
+                    if 0 <= dist < min_dist:
+                        min_dist = dist
+                        img_bytes = ib
+                        img_ext = iext
+                mcqs.append({
+                    "question": q_text_clean,
+                    "options": [opt.strip() for opt in options],
+                    "image": (img_bytes, img_ext) if img_bytes else None
+                })
     return mcqs
 
-def latex_to_image(latex: str) -> io.BytesIO:
+def create_word_table(mcqs):
     """
-    Render LaTeX string to an image buffer.
-    """
-    import matplotlib.pyplot as plt
-    buf = io.BytesIO()
-    fig = plt.figure(figsize=(0.01, 0.01))
-    fig.text(0, 0, f'${latex}$', fontsize=14)
-    plt.axis('off')
-    fig.savefig(buf, dpi=300, transparent=True, bbox_inches='tight', pad_inches=0)
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
-def detect_and_extract_equations(text: str):
-    """
-    Find inline LaTeX equations demarcated by $...$ and return mapping.
-    """
-    eqns = re.findall(r'\$(.+?)\$', text)
-    return eqns
-
-def create_word_document(mcqs):
-    """
-    Build a .docx in memory with questions in col1, options in subsequent cols,
-    converting any inline $...$ to images.
+    Creates a Word document with a table:
+    - First column: Question text and image (if any)
+    - Next columns: Options
     """
     doc = Document()
-    doc.add_heading("Multiple Choice Questions", level=1)
-    doc.add_paragraph(f"Total Questions: {len(mcqs)}\n")
-
+    max_options = max(len(mcq["options"]) for mcq in mcqs)
+    table = doc.add_table(rows=1, cols=1+max_options)
+    hdr_cells = table.rows[0].cells
+    hdr_cells[0].text = 'Question'
+    for i in range(max_options):
+        hdr_cells[i+1].text = f"Option {chr(65+i)}"
     for mcq in mcqs:
-        cols = 1 + len(mcq["options"])
-        table = doc.add_table(rows=1, cols=cols, style="Table Grid")
-        row = table.rows[0]
+        row_cells = table.add_row().cells
+        # Add question text and image
+        p = row_cells[0].paragraphs[0]
+        p.add_run(mcq["question"])
+        if mcq["image"]:
+            img_bytes, img_ext = mcq["image"]
+            image_stream = io.BytesIO(img_bytes)
+            try:
+                # Optionally resize image for better fit
+                pil_img = Image.open(image_stream)
+                pil_img.thumbnail((250, 250))
+                img_buffer = io.BytesIO()
+                pil_img.save(img_buffer, format="PNG")
+                img_buffer.seek(0)
+                p.add_run().add_picture(img_buffer, width=Inches(1.5))
+            except Exception:
+                pass  # If image fails, skip it
+        # Add options
+        for i, opt in enumerate(mcq["options"]):
+            row_cells[i+1].text = opt
+    return doc
 
-        # process question text: detect equations
-        qcell = row.cells[0]
-        qpara = qcell.paragraphs[0]
-        qtext = mcq["question"]
-        eqs = detect_and_extract_equations(qtext)
-        # split by inline equations
-        parts = re.split(r'(\$.+?\$)', qtext)
-        for part in parts:
-            if part.startswith("$") and part.endswith("$"):
-                latex = part.strip("$")
-                img_buf = latex_to_image(latex)
-                run = qpara.add_run()
-                run.add_picture(img_buf, width=Inches(2))
-            else:
-                clean = cleanup_text(part)
-                if clean:
-                    qpara.add_run(clean)
-
-        # options
-        for idx, opt in enumerate(mcq["options"]):
-            cell = row.cells[idx + 1]
-            para = cell.paragraphs[0]
-            otext = opt["text"]
-            eqs_o = detect_and_extract_equations(otext)
-            parts_o = re.split(r'(\$.+?\$)', otext)
-            for part in parts_o:
-                if part.startswith("$") and part.endswith("$"):
-                    buf = latex_to_image(part.strip("$"))
-                    run = para.add_run()
-                    run.add_picture(buf, width=Inches(1.2))
-                else:
-                    clean = cleanup_text(part)
-                    if clean:
-                        qpara.add_run(clean)
-
-        doc.add_paragraph()  # spacer
-
-    mem = io.BytesIO()
-    doc.save(mem)
-    mem.seek(0)
-    return mem
-
-def main():
-    st.title("📝 Advanced MCQ Processor")
-    uploaded = st.file_uploader("Upload PDF/DOCX/TXT", type=["pdf", "docx", "txt"])
-    if not uploaded:
-        st.info("Please upload a file.")
-        return
-
-    if uploaded.type == "application/pdf":
-        raw_text = extract_text_advanced(uploaded)
-    elif uploaded.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        import docx
-        doc = docx.Document(uploaded)
-        raw_text = "\n".join(p.text for p in doc.paragraphs)
-    else:
-        raw_text = uploaded.read().decode("utf-8")
-
-    mcqs = parse_mcq_text(raw_text)
+uploaded_file = st.file_uploader("Upload your MCQ PDF", type=["pdf"])
+if uploaded_file:
+    with st.spinner("Extracting questions and images..."):
+        mcqs = extract_mcqs_and_images(uploaded_file)
     if not mcqs:
-        st.error("No MCQs detected.")
-        return
-
-    st.success(f"Extracted {len(mcqs)} questions")
-    if st.button("Download Word"):
-        doc_io = create_word_document(mcqs)
+        st.error("No MCQs found. Please check your PDF format.")
+    else:
+        st.success(f"Found {len(mcqs)} questions.")
+        doc = create_word_table(mcqs)
+        buffer = io.BytesIO()
+        doc.save(buffer)
+        buffer.seek(0)
         st.download_button(
-            "Download .docx",
-            data=doc_io.getvalue(),
-            file_name="mcqs_processed.docx",
+            label="Download Word Table",
+            data=buffer,
+            file_name="mcq_table_with_images.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
+        if st.checkbox("Preview extracted questions"):
+            for i, mcq in enumerate(mcqs, 1):
+                st.markdown(f"**Q{i}:** {mcq['question']}")
+                if mcq['image']:
+                    st.image(mcq['image'][0], caption=f"Image for Q{i}", width=150)
+                for j, opt in enumerate(mcq['options']):
+                    st.markdown(f"- {chr(65+j)}. {opt}")
 
-if __name__ == "__main__":
-    main()
+st.markdown("""
+---
+**Instructions:**  
+- The PDF should contain MCQs in a format similar to your sample files:  
+  Each question starts with a number and options are marked (A), (B), etc.
+- Images are associated with the nearest preceding question.
+- Images are resized for better fit in the Word table.
+""")
