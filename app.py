@@ -19,17 +19,6 @@ def cleanup_text(s: str) -> str:
     """
     return _invalid_xml_chars_re.sub("", s)
 
-
-# In your create_word_document, update every run of add_run(part) to:
-for part in parts:
-    if part.startswith("$") and part.endswith("$"):
-        # … equation handling …
-    else:
-        clean = cleanup_text(part)
-        if clean:
-            qpara.add_run(clean)
-
-
 # Configure Streamlit page
 st.set_page_config(page_title="MCQ Processor", layout="wide")
 
