@@ -1,6 +1,6 @@
 # app.py
 import streamlit as st
-import fitz  # PyMuPDF
+import pymupdf as fitz  # Correct import for PyMuPDF
 from docx import Document
 from docx.shared import Inches
 import io
