@@ -4,3 +4,4 @@ pdfplumber
 pytesseract
 matplotlib
 PyMuPDF>=1.26.0
+pillow
