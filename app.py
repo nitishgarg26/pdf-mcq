@@ -2,7 +2,7 @@ import streamlit as st
 import io
 import re
 
-import fitz  # PyMuPDF
+import pymupdf as fitz
 import pdfplumber
 import pytesseract
 from PIL import Image
