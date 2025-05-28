@@ -1,123 +1,183 @@
 import streamlit as st
-import pdfplumber
-from docx import Document
 import io
 import re
 
-# Page configuration
-st.set_page_config(
-    page_title="MCQ Document Processor",
-    page_icon="📝",
-    layout="wide"
-)
+import fitz  # PyMuPDF
+import pdfplumber
+import pytesseract
+from PIL import Image
 
-def parse_mcq_text(text):
-    """Parse raw text into a list of MCQs."""
+from docx import Document
+from docx.shared import Inches
+
+# Configure Streamlit page
+st.set_page_config(page_title="MCQ Processor", layout="wide")
+
+def clean_labels(text: str) -> str:
+    """
+    Remove question numbers (e.g. "1.") and option labels "(A)", "(B)", etc.
+    """
+    # strip leading question numbers
+    text = re.sub(r'^\s*\d+\.\s*', '', text, flags=re.MULTILINE)
+    # replace option labels with line breaks
+    text = re.sub(r'\s*\([A-D1-4]\)\s*', '\n', text)
+    return text.strip()
+
+def extract_text_advanced(uploaded_file) -> str:
+    """
+    Use PyMuPDF + OCR fallback + pdfplumber to get high-fidelity text.
+    """
+    pdf_bytes = uploaded_file.read()
+    text = ""
+    # 1. Use PyMuPDF for text
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    for page in doc:
+        block = page.get_text("text")
+        if block and len(block.strip()) > 20:
+            text += block + "\n"
+        else:
+            # OCR fallback
+            pix = page.get_pixmap(dpi=300)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            ocr = pytesseract.image_to_string(img, config="--psm 1")
+            text += ocr + "\n"
+    doc.close()
+    # 2. Supplement with pdfplumber (tables, columns)
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf2:
+            for p in pdf2.pages:
+                tbl_text = p.extract_text()
+                if tbl_text:
+                    text += tbl_text + "\n"
+    except Exception:
+        pass
+    return text
+
+def parse_mcq_text(raw: str):
+    """
+    Split raw text into MCQ blocks, clean labels, extract questions and options.
+    """
     mcqs = []
-    # Normalize whitespace
-    text = re.sub(r'\s+', ' ', text)
-    # Split into question blocks like "1. …"
-    pattern = r'(\d+)\.\s*(.*?)(?=\d+\.|$)'
-    for qnum, content in re.findall(pattern, text, flags=re.DOTALL):
-        # Find options (A), (B), ...
-        opts = re.findall(r'\(([A-D])\)\s*([^()]+)', content)
-        if len(opts) >= 2:
-            # Extract question text up to first option
-            first_opt = content.find(f'({opts[0][0]})')
-            qtext = content[:first_opt].strip()
-            # Clean text
-            qtext = re.sub(r'\s+', ' ', qtext)
-            options = [{'label': lab, 'text': re.sub(r'\s+', ' ', txt).strip()}
-                       for lab, txt in opts]
-            mcqs.append({
-                'number': qnum,
-                'question': qtext,
-                'options': options
-            })
+    cleaned = clean_labels(raw)
+    # question blocks like "1. ..." -> after cleaning, look for splits by blank lines and numbering
+    blocks = re.split(r'\n(?=\d+\.)', raw)
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        # remove original numbering and option labels
+        block = clean_labels(block)
+        # split question vs options
+        parts = [p.strip() for p in block.split('\n') if p.strip()]
+        if len(parts) < 2:
+            continue
+        question_text = parts[0]
+        option_texts = parts[1:]
+        options = [{"text": o} for o in option_texts]
+        mcqs.append({"question": question_text, "options": options})
     return mcqs
 
-def extract_mcq_from_pdf(uploaded_file):
-    """Extract text from PDF and parse MCQs."""
-    text = ""
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    return parse_mcq_text(text)
-
-def extract_mcq_from_docx(uploaded_file):
-    """Extract text from DOCX and parse MCQs."""
-    doc = Document(uploaded_file)
-    text = "\n".join(para.text for para in doc.paragraphs if para.text.strip())
-    return parse_mcq_text(text)
-
-def create_word_document(mcqs):
-    """Generate a Word document in memory from parsed MCQs."""
-    doc = Document()
-    doc.add_heading('Multiple Choice Questions', level=1)
-    doc.add_paragraph(f'Total Questions: {len(mcqs)}\n')
-    for mcq in mcqs:
-        # Create table: 1 column for question + len(options) columns
-        cols = 1 + len(mcq['options'])
-        table = doc.add_table(rows=1, cols=cols, style='Table Grid')
-        row = table.rows[0]
-        # Question cell
-        row.cells[0].text = f"Q{mcq['number']}: {mcq['question']}"
-        # Option cells
-        for i, opt in enumerate(mcq['options']):
-            row.cells[i+1].text = f"({opt['label']}) {opt['text']}"
-        doc.add_paragraph()  # spacing
-    # Save to bytes
+def latex_to_image(latex: str) -> io.BytesIO:
+    """
+    Render LaTeX string to an image buffer.
+    """
+    import matplotlib.pyplot as plt
     buf = io.BytesIO()
-    doc.save(buf)
+    fig = plt.figure(figsize=(0.01, 0.01))
+    fig.text(0, 0, f'${latex}$', fontsize=14)
+    plt.axis('off')
+    fig.savefig(buf, dpi=300, transparent=True, bbox_inches='tight', pad_inches=0)
+    plt.close(fig)
     buf.seek(0)
     return buf
 
+def detect_and_extract_equations(text: str):
+    """
+    Find inline LaTeX equations demarcated by $...$ and return mapping.
+    """
+    eqns = re.findall(r'\$(.+?)\$', text)
+    return eqns
+
+def create_word_document(mcqs):
+    """
+    Build a .docx in memory with questions in col1, options in subsequent cols,
+    converting any inline $...$ to images.
+    """
+    doc = Document()
+    doc.add_heading("Multiple Choice Questions", level=1)
+    doc.add_paragraph(f"Total Questions: {len(mcqs)}\n")
+
+    for mcq in mcqs:
+        cols = 1 + len(mcq["options"])
+        table = doc.add_table(rows=1, cols=cols, style="Table Grid")
+        row = table.rows[0]
+
+        # process question text: detect equations
+        qcell = row.cells[0]
+        qpara = qcell.paragraphs[0]
+        qtext = mcq["question"]
+        eqs = detect_and_extract_equations(qtext)
+        # split by inline equations
+        parts = re.split(r'(\$.+?\$)', qtext)
+        for part in parts:
+            if part.startswith("$") and part.endswith("$"):
+                latex = part.strip("$")
+                img_buf = latex_to_image(latex)
+                run = qpara.add_run()
+                run.add_picture(img_buf, width=Inches(2))
+            else:
+                qpara.add_run(part)
+
+        # options
+        for idx, opt in enumerate(mcq["options"]):
+            cell = row.cells[idx + 1]
+            para = cell.paragraphs[0]
+            otext = opt["text"]
+            eqs_o = detect_and_extract_equations(otext)
+            parts_o = re.split(r'(\$.+?\$)', otext)
+            for part in parts_o:
+                if part.startswith("$") and part.endswith("$"):
+                    buf = latex_to_image(part.strip("$"))
+                    run = para.add_run()
+                    run.add_picture(buf, width=Inches(1.2))
+                else:
+                    para.add_run(part)
+
+        doc.add_paragraph()  # spacer
+
+    mem = io.BytesIO()
+    doc.save(mem)
+    mem.seek(0)
+    return mem
+
 def main():
-    st.title("📝 MCQ Document Processor")
-    st.markdown("Upload a PDF, DOCX, or TXT file of MCQs to generate a Word document.")
-
-    uploaded = st.file_uploader(
-        "Choose MCQ file",
-        type=['pdf', 'docx', 'txt']
-    )
+    st.title("📝 Advanced MCQ Processor")
+    uploaded = st.file_uploader("Upload PDF/DOCX/TXT", type=["pdf", "docx", "txt"])
     if not uploaded:
-        st.info("Awaiting file upload…")
+        st.info("Please upload a file.")
         return
 
-    file_type = uploaded.name.split('.')[-1].lower()
-    with st.spinner("Processing file…"):
-        if file_type == 'pdf':
-            mcqs = extract_mcq_from_pdf(uploaded)
-        elif file_type == 'docx':
-            mcqs = extract_mcq_from_docx(uploaded)
-        else:  # txt
-            content = uploaded.read().decode('utf-8')
-            mcqs = parse_mcq_text(content)
+    if uploaded.type == "application/pdf":
+        raw_text = extract_text_advanced(uploaded)
+    elif uploaded.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        import docx
+        doc = docx.Document(uploaded)
+        raw_text = "\n".join(p.text for p in doc.paragraphs)
+    else:
+        raw_text = uploaded.read().decode("utf-8")
 
+    mcqs = parse_mcq_text(raw_text)
     if not mcqs:
-        st.error("No MCQs found. Please check file format and content.")
+        st.error("No MCQs detected.")
         return
 
-    st.success(f"✅ Parsed {len(mcqs)} questions!")
-    # Preview first 3 questions
-    with st.expander("Preview Questions", expanded=True):
-        for mcq in mcqs[:3]:
-            st.markdown(f"**Q{mcq['number']}:** {mcq['question']}")
-            cols = st.columns(len(mcq['options']))
-            for col, opt in zip(cols, mcq['options']):
-                col.write(f"({opt['label']}) {opt['text']}")
-            st.markdown("---")
-        if len(mcqs) > 3:
-            st.write(f"...and {len(mcqs) - 3} more questions")
-
-    if st.button("📥 Download Word Document"):
-        doc_buffer = create_word_document(mcqs)
+    st.success(f"Extracted {len(mcqs)} questions")
+    if st.button("Download Word"):
+        doc_io = create_word_document(mcqs)
         st.download_button(
-            label="Download .docx",
-            data=doc_buffer,
-            file_name=f"MCQs_{uploaded.name.rsplit('.',1)[0]}.docx",
+            "Download .docx",
+            data=doc_io.getvalue(),
+            file_name="mcqs_processed.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
 
