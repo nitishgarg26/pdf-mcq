@@ -1,6 +1,6 @@
-streamlit
-pymupdf
-pytesseract
-python-docx
-Pillow
-pix2tex
+streamlit==1.33.0
+pymupdf==1.24.1
+pytesseract==0.3.10
+pillow==10.3.0
+pix2tex==0.0.14
+
