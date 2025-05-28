@@ -1,7 +1,6 @@
 streamlit
-python-docx
-pdfplumber
+pymupdf
 pytesseract
-matplotlib
-PyMuPDF>=1.26.0
-pillow
+python-docx
+Pillow
+pix2tex
