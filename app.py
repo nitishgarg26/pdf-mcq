@@ -22,10 +22,16 @@ if pdf_file is not None:
             full_text += page.get_text()
             images = page.get_images(full=True)
             for img in images:
-                xref = img[0]
-                base_image = pdf_doc.extract_image(xref)
-                image_bytes = base_image["image"]
-                all_images.append(image_bytes)
+                try:
+                    if isinstance(img, tuple) and len(img) > 0:
+                        xref = img[0]
+                        base_image = pdf_doc.extract_image(xref)
+                        image_bytes = base_image.get("image", None)
+                        if image_bytes:
+                            all_images.append(image_bytes)
+                except Exception as img_err:
+                    st.warning(f"Skipping image due to error: {img_err}")
+
 
         # Step 1: Merge text lines into paragraphs
         lines = full_text.splitlines()
