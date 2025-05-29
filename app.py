@@ -29,7 +29,11 @@ if pdf_file is not None:
             blocks.sort(key=lambda b: b['bbox'][1])
             for block in blocks:
                 if block["type"] == 0:  # text block
-                    lines = block["text"].splitlines()
+                    if "text" in block:
+                        lines = block["text"].splitlines()
+                    else:
+                        continue  # skip blocks without text
+
                     for line in lines:
                         text = line.strip()
                         if not text:
