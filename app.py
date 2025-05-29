@@ -1,148 +1,125 @@
-# app.py
 import streamlit as st
-import pymupdf as fitz  # Correct import for PyMuPDF
+import pymupdf as fitz  # PyMuPDF
+import io
+import re
 from docx import Document
 from docx.shared import Inches
-import io
-import pytesseract
-from PIL import Image
-import re
-import os
-from pix2tex import cli as pix2tex
 
-# Configure checkpoint path
-CHECKPOINT_DIR = os.path.join(os.path.expanduser("~"), ".pix2tex")
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+st.title("MCQ PDF to Word Converter")
 
-def initialize_model():
-    """Initialize LatexOCR model with proper error handling"""
+# File uploader for PDF input
+pdf_file = st.file_uploader("Upload a PDF file with MCQs", type=['pdf'])
+if pdf_file is not None:
     try:
-        checkpoint_path = os.path.join(CHECKPOINT_DIR, "checkpoints", "model.pth")
-        if not os.path.exists(checkpoint_path):
-            st.error("Model checkpoints missing! Follow these steps:\n"
-                     "1. Download weights.pth from: https://github.com/lukas-blecher/LaTeX-OCR/releases\n"
-                     "2. Create folder: ~/.pix2tex/checkpoints\n"
-                     "3. Place model.pth in checkpoints folder")
-            return None
-        return pix2tex.LatexOCR()
+        # Read PDF into memory
+        pdf_bytes = pdf_file.read()
+        pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        questions = []
+        current_q = None
+
+        # Regular expressions to detect questions and options
+        question_pattern = re.compile(r'^(?:Q(?:uestion)?\s*)?\d+[\.\)]', re.IGNORECASE)
+        option_pattern = re.compile(r'^[A-D][\.\)]\s*', re.IGNORECASE)
+
+        # Extract text and images from each page
+        for page in pdf_doc:
+            page_dict = page.get_text("dict")
+            blocks = page_dict["blocks"]
+            # Sort blocks by vertical position (top to bottom)
+            blocks.sort(key=lambda b: b['bbox'][1])
+            for block in blocks:
+                if block["type"] == 0:  # text block
+                    lines = block["text"].splitlines()
+                    for line in lines:
+                        text = line.strip()
+                        if not text:
+                            continue
+                        # Detect start of a new question
+                        if question_pattern.match(text):
+                            # Save previous question
+                            if current_q:
+                                questions.append(current_q)
+                            # Remove leading number (e.g., "1.") from question text
+                            q_text = question_pattern.sub("", text).strip()
+                            current_q = {"question_text": q_text, "options": [], "images": []}
+                        # Detect an option line
+                        elif option_pattern.match(text):
+                            if current_q:
+                                # Remove the leading letter (e.g., "A.") from option text
+                                opt_text = option_pattern.sub("", text).strip()
+                                current_q["options"].append(opt_text)
+                        else:
+                            # Continuation line: append to question or last option
+                            if current_q:
+                                if current_q["options"]:
+                                    # Append to last option
+                                    current_q["options"][-1] += " " + text
+                                else:
+                                    # Append to question text
+                                    current_q["question_text"] += " " + text
+                elif block["type"] == 1:  # image block
+                    # Attach any found image to the current question
+                    if current_q:
+                        image_bytes = block["image"]  # raw image bytes from PDF
+                        current_q["images"].append(image_bytes)
+            # End of page blocks
+        # Append the last question if exists
+        if current_q:
+            questions.append(current_q)
+
+        # Preview extracted questions and options
+        if questions:
+            st.header("Extracted Questions")
+            for idx, q in enumerate(questions, start=1):
+                st.markdown(f"**Question {idx}:** {q['question_text']}")
+                # Display associated image(s) if any
+                if q["images"]:
+                    for img_bytes in q["images"]:
+                        st.image(img_bytes)
+                # Display options
+                for opt_idx, opt in enumerate(q["options"], start=1):
+                    st.write(f"{chr(64+opt_idx)}. {opt}")
+        else:
+            st.warning("No questions found in the PDF. Please ensure the format is correct.")
+
+        # Generate Word document with questions in a table
+        if questions:
+            # Ensure exactly 4 options per question (pad with empty if needed)
+            for q in questions:
+                while len(q["options"]) < 4:
+                    q["options"].append("")
+
+            doc = Document()
+            table = doc.add_table(rows=1, cols=5)
+            # Populate the table rows
+            for i, q in enumerate(questions):
+                if i == 0:
+                    row_cells = table.rows[0].cells
+                else:
+                    row_cells = table.add_row().cells
+                # Fill question text and image in the first cell
+                cell = row_cells[0]
+                para = cell.paragraphs[0]
+                para.add_run(q["question_text"])
+                if q["images"]:
+                    for img_bytes in q["images"]:
+                        para.add_run("\n")  # newline before image
+                        run = para.add_run()
+                        run.add_picture(io.BytesIO(img_bytes), width=Inches(2.5))
+                # Fill the four options (A-D) in the next cells
+                for j, opt in enumerate(q["options"], start=1):
+                    row_cells[j].text = opt
+            # Save Word document to a bytes buffer
+            output = io.BytesIO()
+            doc.save(output)
+            output.seek(0)
+            # Download button for the Word file
+            st.download_button(
+                label="Download Word Document",
+                data=output.getvalue(),
+                file_name="questions.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+
     except Exception as e:
-        st.error(f"Model initialization failed: {str(e)}")
-        return None
-
-model = initialize_model()
-
-def clean_content(text, is_question=True):
-    """Clean question numbers and option labels using regex"""
-    patterns = [
-        r'^\s*([A-Za-z]?\d+[\.\)]\s*|Q\d+\s*|\))',  # Question numbers
-        r'^\s*([\(\[]?[A-D1-4][\.\)\]]\s*|•\s*)'     # Option labels
-    ]
-    return re.sub(patterns[0] if is_question else patterns[1], '', text).strip()
-
-def extract_pdf_elements(pdf_bytes):
-    """Extract structured content from PDF with layout preservation"""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    content = []
-    
-    for page in doc:
-        blocks = page.get_text("dict", sort=True)["blocks"]
-        for block in blocks:
-            if block["type"] == 0:  # Text block
-                for line in block["lines"]:
-                    for span in line["spans"]:
-                        text = clean_content(span["text"])
-                        if text:
-                            content.append(("text", text, block["bbox"]))
-            elif block["type"] == 1:  # Image block
-                try:
-                    xref = block["xref"]
-                    base_image = doc.extract_image(xref)
-                    content.append(("image", base_image["image"], block["bbox"]))
-                except Exception as e:
-                    st.warning(f"Skipped image: {str(e)}")
-    return content
-
-def process_image_content(image_bytes):
-    """Process images with hybrid OCR/equation detection"""
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-        return model(img) if model else pytesseract.image_to_string(img)
-    except Exception as e:
-        return pytesseract.image_to_string(img, config='--psm 6')
-
-def generate_word_document(content):
-    """Create structured Word document with cleaned content"""
-    doc = Document()
-    table = doc.add_table(rows=1, cols=5)
-    table.style = 'Table Grid'
-    
-    # Configure column widths
-    table.columns[0].width = Inches(3.5)
-    for col in table.columns[1:]:
-        col.width = Inches(1.5)
-        
-    # Table headers
-    hdr_cells = table.rows[0].cells
-    hdr_cells[0].text = 'Question'
-    hdr_cells[1].text = 'Option 1'
-    hdr_cells[2].text = 'Option 2'
-    hdr_cells[3].text = 'Option 3'
-    hdr_cells[4].text = 'Option 4'
-
-    current_row = table.add_row().cells
-    question_buffer = []
-    options = []
-
-    for item_type, data, _ in content:
-        if item_type == "text":
-            if not options:  # Question text
-                question_buffer.append(data)
-            else:  # Option text
-                options.append(clean_content(data, False))
-                
-        elif item_type == "image":
-            question_buffer.append(f"Equation: {process_image_content(data)}")
-
-        # Create new row when 4 options are accumulated
-        if len(options) == 4:
-            current_row[0].text = '\n'.join(question_buffer)
-            for i, opt in enumerate(options[:4], 1):
-                current_row[i].text = opt
-            current_row = table.add_row().cells
-            question_buffer = []
-            options = []
-
-    return doc
-
-def main():
-    st.title("PDF MCQ to Word Converter")
-    
-    uploaded_file = st.file_uploader("Upload PDF File", type=["pdf"])
-    
-    if uploaded_file:
-        if not model:
-            st.error("OCR model not initialized. Check setup instructions.")
-            return
-            
-        with st.spinner("Processing PDF..."):
-            try:
-                content = extract_pdf_elements(uploaded_file.read())
-                doc = generate_word_document(content)
-                
-                # Save to in-memory buffer
-                buffer = io.BytesIO()
-                doc.save(buffer)
-                buffer.seek(0)
-                
-                st.success("Conversion successful!")
-                st.download_button(
-                    label="Download Word Document",
-                    data=buffer,
-                    file_name="converted_questions.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
-            except Exception as e:
-                st.error(f"Processing failed: {str(e)}")
-
-if __name__ == "__main__":
-    main()
+        st.error(f"Error processing PDF: {e}")

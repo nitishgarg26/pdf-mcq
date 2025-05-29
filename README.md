@@ -1,20 +1,17 @@
-# MCQ Processor Web App
+# MCQ PDF to Word Converter
 
-A Streamlit application that uploads PDF/DOCX/TXT files containing multiple-choice questions, parses the questions and options, and generates a downloadable Word document with questions in the first column and options in subsequent columns.
+This Streamlit app lets you upload a PDF file containing multiple-choice questions (MCQs) with text and images. It extracts each question’s text, any associated image, and the four answer options, then generates a downloadable Word document where each question is a row in a table. The columns are: **Question (and image)**, **Option A**, **Option B**, **Option C**, **Option D**. Even if the original question has fewer than four options, the output table always has four option columns (blank if not available).
 
 ## Features
 
-- Upload and parse PDF, DOCX, and TXT files  
-- Extract JEE-style MCQs with question numbering and options  
-- Preview a subset of parsed questions in the browser  
-- Generate a formatted `.docx` file with each question in a table row  
-- One-click download of the generated Word document  
+- Upload a PDF with MCQs (text + images).
+- Automatic extraction of questions, images, and options A–D.
+- Preview extracted questions in the app.
+- Download a formatted Word (`.docx`) file with questions in a table.
 
-## Prerequisites
+## Setup Instructions
 
-- Python 3.8 or later  
-- Git  
-
-## Installation
-
-1. Clone the repository  
+1. **Clone the repository** to your local machine.
+2. Install the required libraries:
+   ```bash
+   pip install -r requirements.txt
