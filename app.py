@@ -1,5 +1,5 @@
 import streamlit as st
-import pymupdf as fitz  # PyMuPDF
+import fitz  # PyMuPDF
 import io
 import re
 from docx import Document
@@ -7,7 +7,6 @@ from docx.shared import Inches
 
 st.title("MCQ PDF to Word Converter")
 
-# Upload the PDF
 pdf_file = st.file_uploader("Upload a PDF file with MCQs", type=["pdf"])
 if pdf_file is not None:
     try:
@@ -17,23 +16,23 @@ if pdf_file is not None:
         full_text = ""
         all_images = []
 
-        # Collect full text and all images
+        # --- Extract text and image blocks ---
         for page in pdf_doc:
+            # Extract text
             full_text += page.get_text()
-            images = page.get_images(full=True)
-            for img in images:
-                try:
-                    if isinstance(img, tuple) and len(img) > 0:
-                        xref = img[0]
-                        base_image = pdf_doc.extract_image(xref)
-                        image_bytes = base_image.get("image", None)
+
+            # Extract images from block dictionary
+            page_dict = page.get_text("dict")
+            for block in page_dict.get("blocks", []):
+                if block["type"] == 1 and "image" in block:
+                    try:
+                        image_bytes = block["image"]
                         if image_bytes:
                             all_images.append(image_bytes)
-                except Exception as img_err:
-                    st.warning(f"Skipping image due to error: {img_err}")
+                    except Exception as e:
+                        st.warning(f"Skipping image: {e}")
 
-
-        # Step 1: Merge text lines into paragraphs
+        # --- Clean and structure text into paragraphs ---
         lines = full_text.splitlines()
         paragraphs = []
         current_para = ""
@@ -47,26 +46,24 @@ if pdf_file is not None:
         if current_para:
             paragraphs.append(current_para.strip())
 
-        # Step 2: Extract questions and options
-        question_pattern = re.compile(r'^\d{1,3}\.\s+(.*)', re.DOTALL)
-        option_pattern = re.compile(r'^\(?[A-D]\)?[\.:]?\s+(.*)', re.DOTALL)
+        # --- Parse questions and options ---
+        question_pattern = re.compile(r'^\d{1,3}\.\s+')
+        option_pattern = re.compile(r'^\(?[A-D]\)?[\.:]?\s+')
 
         questions = []
         current_q = None
 
         for para in paragraphs:
-            if re.match(r'^\d{1,3}\.', para.strip()):
-                # Start of a new question
+            if question_pattern.match(para):
                 if current_q:
                     questions.append(current_q)
-                q_text = re.sub(r'^\d{1,3}\.\s*', '', para).strip()
+                q_text = question_pattern.sub('', para).strip()
                 current_q = {"question_text": q_text, "options": [], "images": []}
-            elif option_pattern.match(para.strip()):
+            elif option_pattern.match(para):
                 if current_q:
-                    opt_text = option_pattern.sub(r'\1', para).strip()
+                    opt_text = option_pattern.sub('', para).strip()
                     current_q["options"].append(opt_text)
             else:
-                # Continuation
                 if current_q:
                     if current_q["options"]:
                         current_q["options"][-1] += " " + para.strip()
@@ -76,25 +73,24 @@ if pdf_file is not None:
         if current_q:
             questions.append(current_q)
 
-        # Assign 1 image per question, in order (if needed)
+        # --- Attach one image per question (optional, naive match) ---
         for i, q in enumerate(questions):
             if i < len(all_images):
                 q["images"].append(all_images[i])
 
-        # Display extracted content
+        # --- Display parsed questions ---
         if questions:
             st.header("Extracted Questions")
             for idx, q in enumerate(questions, start=1):
                 st.markdown(f"**Question {idx}:** {q['question_text']}")
-                if q["images"]:
-                    for img in q["images"]:
-                        st.image(img)
+                for img in q["images"]:
+                    st.image(img)
                 for j, opt in enumerate(q["options"], start=1):
                     st.write(f"{chr(64 + j)}. {opt}")
         else:
-            st.warning("No questions found. Please check PDF formatting.")
+            st.warning("No questions found. Check PDF formatting.")
 
-        # Build Word doc
+        # --- Build Word Document ---
         if questions:
             for q in questions:
                 while len(q["options"]) < 4:
@@ -104,22 +100,16 @@ if pdf_file is not None:
             table = doc.add_table(rows=1, cols=5)
 
             for i, q in enumerate(questions):
-                if i == 0:
-                    row_cells = table.rows[0].cells
-                else:
-                    row_cells = table.add_row().cells
-                cell = row_cells[0]
-                para = cell.paragraphs[0]
+                row = table.add_row().cells if i > 0 else table.rows[0].cells
+                para = row[0].paragraphs[0]
                 para.add_run(q["question_text"])
-                if q["images"]:
-                    for img_bytes in q["images"]:
-                        para.add_run("\n")
-                        run = para.add_run()
-                        run.add_picture(io.BytesIO(img_bytes), width=Inches(2.5))
-                for j, opt in enumerate(q["options"], start=1):
-                    row_cells[j].text = opt
+                for img_bytes in q["images"]:
+                    para.add_run("\n")
+                    para.add_run().add_picture(io.BytesIO(img_bytes), width=Inches(2.5))
+                for j in range(4):
+                    row[j + 1].text = q["options"][j]
 
-            # Save doc
+            # Save to buffer and offer download
             output = io.BytesIO()
             doc.save(output)
             output.seek(0)
@@ -130,5 +120,6 @@ if pdf_file is not None:
                 file_name="questions.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             )
+
     except Exception as e:
         st.error(f"Error processing PDF: {e}")
